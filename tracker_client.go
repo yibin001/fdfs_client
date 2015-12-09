@@ -3,6 +3,7 @@ package fdfs_client
 import (
 	"bytes"
 	"encoding/binary"
+	"math/rand"
 	"net"
 )
 
@@ -10,7 +11,152 @@ type TrackerClient struct {
 	pool *ConnectionPool
 }
 
+func getInterfaceAddrs() (ip string, err error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return
+	}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				ip = ipnet.IP.String()
+				return
+			}
+		}
+	}
+	return
+}
+
+//从所有可用的storageserver中取出同一局域网的机器
+func (this *TrackerClient) trackerQueryStorageStorWithGroupV2(groupName string) (*StorageServer, error) {
+	var (
+		conn     net.Conn
+		recvBuff []byte
+		err      error
+	)
+
+	conn, err = this.pool.Get()
+	defer conn.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	th := &trackerHeader{}
+	th.cmd = TRACKER_PROTO_CMD_SERVICE_QUERY_STORE_WITH_GROUP_ALL
+	th.pkgLen = int64(FDFS_GROUP_NAME_MAX_LEN)
+	th.sendHeader(conn)
+
+	groupBuffer := new(bytes.Buffer)
+	// 16 bit groupName
+	groupNameBytes := bytes.NewBufferString(groupName).Bytes()
+	for i := 0; i < 16; i++ {
+		if i >= len(groupNameBytes) {
+			groupBuffer.WriteByte(byte(0))
+		} else {
+			groupBuffer.WriteByte(groupNameBytes[i])
+		}
+	}
+	groupBytes := groupBuffer.Bytes()
+
+	err = TcpSendData(conn, groupBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	th.recvHeader(conn)
+	if th.status != 0 {
+		logger.Warnf("recvHeader error [%d]", th.status)
+		return nil, Errno{int(th.status)}
+	}
+
+	var (
+		ipAddr         string
+		port           int64
+		storePathIndex uint8
+	)
+	recvBuff, _, err = TcpRecvResponse(conn, th.pkgLen)
+	if err != nil {
+		logger.Warnf("TcpRecvResponse error :%s", err.Error())
+		return nil, err
+	}
+	buff := bytes.NewBuffer(recvBuff)
+	// #recv_fmt |-group_name(16)-ipaddr(16-1)-port(8)-store_path_index(1)|
+	groupName, err = readCstr(buff, FDFS_GROUP_NAME_MAX_LEN)
+
+	storageCount := (len(recvBuff) - 1) / (FDFS_GROUP_NAME_MAX_LEN + FDFS_PROTO_PKG_LEN_SIZE)
+	allStorage := make([]*StorageServer, storageCount)
+	for i := 0; i < storageCount; i++ {
+		ipAddr, err = readCstr(buff, IP_ADDRESS_SIZE-1)
+		binary.Read(buff, binary.BigEndian, &port)
+		allStorage[i] = &StorageServer{ipAddr, int(port), groupName, -1}
+	}
+
+	binary.Read(buff, binary.BigEndian, &storePathIndex)
+
+	for _, item := range allStorage {
+		item.storePathIndex = int(storePathIndex)
+	}
+
+	return allStorage[rand.Intn(len(allStorage))], nil
+
+}
+
+//从所有可用的storageserver中取出同一局域网的机器
+func (this *TrackerClient) trackerQueryStorageStorWithoutGroupV2() (*StorageServer, error) {
+	var (
+		conn     net.Conn
+		recvBuff []byte
+		err      error
+	)
+
+	conn, err = this.pool.Get()
+
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	th := &trackerHeader{}
+	th.cmd = TRACKER_PROTO_CMD_SERVICE_QUERY_STORE_WITHOUT_GROUP_ALL
+	th.sendHeader(conn)
+
+	th.recvHeader(conn)
+	if th.status != 0 {
+		return nil, Errno{int(th.status)}
+	}
+
+	var (
+		groupName      string
+		ipAddr         string
+		port           int64
+		storePathIndex uint8
+	)
+	recvBuff, _, err = TcpRecvResponse(conn, th.pkgLen)
+	if err != nil {
+		logger.Warnf("TcpRecvResponse error :%s", err.Error())
+		return nil, err
+	}
+	buff := bytes.NewBuffer(recvBuff)
+	groupName, err = readCstr(buff, FDFS_GROUP_NAME_MAX_LEN)
+	storageCount := (len(recvBuff) - 1) / (FDFS_GROUP_NAME_MAX_LEN + FDFS_PROTO_PKG_LEN_SIZE)
+	allStorage := make([]*StorageServer, storageCount)
+	for i := 0; i < storageCount; i++ {
+		ipAddr, err = readCstr(buff, IP_ADDRESS_SIZE-1)
+		binary.Read(buff, binary.BigEndian, &port)
+		allStorage[i] = &StorageServer{ipAddr, int(port), groupName, -1}
+	}
+
+	binary.Read(buff, binary.BigEndian, &storePathIndex)
+
+	for _, item := range allStorage {
+		item.storePathIndex = int(storePathIndex)
+	}
+
+	return allStorage[rand.Intn(len(allStorage))], nil
+}
+
 func (this *TrackerClient) trackerQueryStorageStorWithoutGroup() (*StorageServer, error) {
+	return this.trackerQueryStorageStorWithoutGroupV2()
 	var (
 		conn     net.Conn
 		recvBuff []byte
@@ -53,6 +199,7 @@ func (this *TrackerClient) trackerQueryStorageStorWithoutGroup() (*StorageServer
 }
 
 func (this *TrackerClient) trackerQueryStorageStorWithGroup(groupName string) (*StorageServer, error) {
+	return this.trackerQueryStorageStorWithGroupV2(groupName)
 	var (
 		conn     net.Conn
 		recvBuff []byte
